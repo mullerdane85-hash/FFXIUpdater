@@ -21,7 +21,7 @@ ARE DISCLAIMED.
 
 _addon = {}
 _addon.name      = 'FFXIUpdater'
-_addon.version   = '1.3.0'
+_addon.version   = '1.3.1'
 _addon.author    = 'TWinn22'
 _addon.commands  = {'fu', 'ffxiupdater', 'update'}
 
@@ -457,12 +457,21 @@ local function point_in_rect(x, y, x1, y1, x2, y2)
 end
 
 -- Small builder helpers to keep build_ui readable.
+--
+-- CRITICAL: pass `draggable = false`. Windower's images library defaults
+-- it to TRUE, which means every rectangle on the panel becomes its own
+-- click-and-drag target — the user grabs one band of the window and it
+-- floats off on its own, leaving the rest behind. That's what caused
+-- the "every separate color piece moves independently" report. We want
+-- only the title-bar drag handler in this addon's mouse event to move
+-- the window.
 local function img(x, y, w, h, c)
     return images.new({
-        pos     = {x = x, y = y},
-        size    = {width = w, height = h},
-        color   = {alpha = c.a, red = c.r, green = c.g, blue = c.b},
-        visible = false,
+        pos       = {x = x, y = y},
+        size      = {width = w, height = h},
+        color     = {alpha = c.a, red = c.r, green = c.g, blue = c.b},
+        draggable = false,
+        visible   = false,
     })
 end
 
