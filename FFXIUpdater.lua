@@ -21,7 +21,7 @@ ARE DISCLAIMED.
 
 _addon = {}
 _addon.name      = 'FFXIUpdater'
-_addon.version   = '1.1.0'
+_addon.version   = '1.1.1'
 _addon.author    = 'TWinn22'
 _addon.commands  = {'fu', 'ffxiupdater', 'update'}
 
@@ -86,13 +86,28 @@ local function write_file(path, content)
     return true
 end
 
--- //fu pull — visible cmd window, pauses so user can read the result
+-- //fu pull — visible cmd window, pauses so user can read the result.
+-- Also drives the UI feedback path: button label flips to "Updating...",
+-- body gets a banner, and after 8s we refresh status and report whether
+-- the commit actually changed.
 local function do_update()
     if not is_git_checkout() then
         say(167, 'Windower root is not a git checkout (.git missing).')
+        if settings.visible then set_status_msg('Not a git checkout — cannot update.', 'warn') end
         return
     end
+
+    -- Remember the commit hash from before the pull so we can tell
+    -- "already up to date" from "actually updated" after the bat finishes.
+    ui.last_commit_before_update = ui.state.commit
+
     local bat = addon_dir .. '/pull.bat'
+    local pull_log = addon_dir .. '/pull.result'
+    -- We also pipe a sentinel into pull.result so the addon can detect
+    -- when the bat finished (the file appears after `git pull` returns).
+    -- The cmd window stays open with `pause >nul` for the user to read,
+    -- but the result file lets us update the panel even if they leave
+    -- the cmd window minimized.
     local content = table.concat({
         '@echo off',
         'title FFXIUpdater - git pull',
@@ -100,16 +115,73 @@ local function do_update()
         'echo === FFXIUpdater: pulling latest from origin ===',
         'echo.',
         'git pull',
+        'set EC=%errorlevel%',
+        -- Write the exit code as a one-byte marker file so the addon can
+        -- detect completion without parsing the verbose pull transcript.
+        '> "' .. pull_log .. '" echo %EC%',
         'echo.',
         'echo === done. press any key to close ===',
         'pause >nul',
     }, '\r\n') .. '\r\n'
+
     if not write_file(bat, content) then return end
+
+    -- Clear any stale completion marker from a previous run.
+    os.remove(pull_log)
+
+    -- Feedback: in-game chat, button visual, body banner.
     say(207, 'Starting update — a cmd window will show git pull output.')
+    if settings.visible then
+        set_update_button_busy(true)
+        set_status_msg('Updating... (cmd window opened — output is there)', 'info')
+    end
+    ui.update_in_progress = true
+
     windower.send_command('@exec ' .. bat)
-    -- After 8s, refresh the in-window status (gives `git pull` time to
-    -- finish). If the window is closed by then this is a no-op.
-    coroutine.schedule(refresh_status_async, 8)
+
+    -- Poll for completion. Most pulls finish in 2-6 s. We check every
+    -- second for up to 60 s; the moment pull.result appears we refresh
+    -- status and switch the banner to a success/no-change message.
+    local poll_count = 0
+    local function poll()
+        poll_count = poll_count + 1
+        local f = io.open(pull_log, 'r')
+        if f then
+            -- git pull is done — read the marker (we don't actually use
+            -- the exit code yet, presence of the file is enough).
+            f:close()
+            os.remove(pull_log)
+            ui.update_in_progress = false
+            -- Re-read git state, which will update ui.state.commit.
+            refresh_status_async()
+            -- After the status refresh completes (~1.5 s), compare commits.
+            coroutine.schedule(function()
+                local before = ui.last_commit_before_update or ''
+                local after  = ui.state.commit or ''
+                local same   = (before:sub(1, 7) == after:sub(1, 7))
+                if settings.visible then
+                    set_update_button_busy(false)
+                    if same then
+                        set_status_msg('Already up to date (' .. after:sub(1, 7) .. ').', 'ok')
+                    else
+                        set_status_msg('Update complete — now at ' .. after:sub(1, 7) .. '. Reload affected addons.', 'ok')
+                    end
+                end
+                say(207, same and 'Already up to date.' or ('Update complete — now at ' .. after:sub(1, 7) .. '.'))
+            end, 2)
+            return
+        end
+        if poll_count < 60 then
+            coroutine.schedule(poll, 1)
+        else
+            ui.update_in_progress = false
+            if settings.visible then
+                set_update_button_busy(false)
+                set_status_msg('Update timed out after 60 s. Check the cmd window.', 'warn')
+            end
+        end
+    end
+    coroutine.schedule(poll, 2)
 end
 
 -- ============================================================================
@@ -151,11 +223,15 @@ local ui = {
         commit  = '?',
         dirty   = '?',
         checked = 'never',
+        msg     = '',            -- bottom-of-body status banner (e.g. "Updating...")
+        msg_color = 'info',      -- 'info' | 'ok' | 'warn'
     },
     drag = {
         active = false,
         ox = 0, oy = 0,        -- offset from cursor to window origin while dragging
     },
+    update_in_progress = false,
+    last_commit_before_update = nil,  -- so we can detect actual change after pull
 }
 
 -- ---------------------------------------------------------------------------
@@ -263,33 +339,66 @@ end
 
 -- ---------------------------------------------------------------------------
 -- Reposition all UI elements after a drag.
+-- Use the combined :pos(x, y) form on texts — separate :pos_x() / :pos_y()
+-- calls were dropping one axis on some Windower builds, which is what
+-- made the title / body / button labels stay put when dragging the panel.
+-- :pos(x, y) sets both atomically and triggers the redraw cleanly.
 -- ---------------------------------------------------------------------------
 local function move_ui(dx, dy)
     settings.pos.x = settings.pos.x + dx
     settings.pos.y = settings.pos.y + dy
-    if ui.panel           then ui.panel:pos_x(settings.pos.x);            ui.panel:pos_y(settings.pos.y) end
-    if ui.border          then ui.border:pos_x(settings.pos.x);           ui.border:pos_y(settings.pos.y) end
-    if ui.title           then ui.title:pos_x(settings.pos.x + 12);       ui.title:pos_y(settings.pos.y + 6) end
-    if ui.body            then ui.body:pos_x(settings.pos.x + 14);        ui.body:pos_y(settings.pos.y + 40) end
-    if ui.btn_close       then ui.btn_close:pos_x(settings.pos.x + W - 28); ui.btn_close:pos_y(settings.pos.y + 4) end
-    if ui.btn_close_lbl   then ui.btn_close_lbl:pos_x(settings.pos.x + W - 22); ui.btn_close_lbl:pos_y(settings.pos.y + 5) end
-    if ui.btn_refresh     then ui.btn_refresh:pos_x(settings.pos.x + 16); ui.btn_refresh:pos_y(settings.pos.y + 158) end
-    if ui.btn_refresh_lbl then ui.btn_refresh_lbl:pos_x(settings.pos.x + 42); ui.btn_refresh_lbl:pos_y(settings.pos.y + 164) end
-    if ui.btn_update      then ui.btn_update:pos_x(settings.pos.x + 140); ui.btn_update:pos_y(settings.pos.y + 158) end
-    if ui.btn_update_lbl  then ui.btn_update_lbl:pos_x(settings.pos.x + 168); ui.btn_update_lbl:pos_y(settings.pos.y + 164) end
+    local px, py = settings.pos.x, settings.pos.y
+    if ui.panel           then ui.panel:pos(px, py) end
+    if ui.border          then ui.border:pos(px, py) end
+    if ui.title           then ui.title:pos(px + 12, py + 6) end
+    if ui.body            then ui.body:pos(px + 14, py + 40) end
+    if ui.btn_close       then ui.btn_close:pos(px + W - 28, py + 4) end
+    if ui.btn_close_lbl   then ui.btn_close_lbl:pos(px + W - 22, py + 5) end
+    if ui.btn_refresh     then ui.btn_refresh:pos(px + 16, py + 158) end
+    if ui.btn_refresh_lbl then ui.btn_refresh_lbl:pos(px + 42, py + 164) end
+    if ui.btn_update      then ui.btn_update:pos(px + 140, py + 158) end
+    if ui.btn_update_lbl  then ui.btn_update_lbl:pos(px + 168, py + 164) end
 end
 
 -- ---------------------------------------------------------------------------
--- Render the cached state into the body text.
+-- Render the cached state into the body text. If a status message is
+-- set (msg field), it appears as an extra line at the bottom — used to
+-- give immediate feedback when the Update button is clicked, before
+-- the actual git pull completes.
 -- ---------------------------------------------------------------------------
 local function redraw_body()
     local s = ui.state
-    ui.body:text(string.format(
+    local body = string.format(
         'Branch:   %s\n' ..
         'Commit:   %s\n' ..
         'Status:   %s\n' ..
         'Checked:  %s',
-        s.branch, s.commit, s.dirty, s.checked))
+        s.branch, s.commit, s.dirty, s.checked)
+    if s.msg and s.msg ~= '' then
+        body = body .. '\n\n>> ' .. s.msg
+    end
+    ui.body:text(body)
+end
+
+-- Update-button visual state. When an update is running, the button is
+-- dimmed and its label changes to "Updating..." so the user knows the
+-- click registered even before they see the cmd window appear.
+local function set_update_button_busy(busy)
+    if not ui.btn_update then return end
+    if busy then
+        ui.btn_update:color(70, 90, 110)         -- dim slate
+        if ui.btn_update_lbl then ui.btn_update_lbl:text('Updating...') end
+    else
+        ui.btn_update:color(58, 111, 165)        -- accent cyan/blue
+        if ui.btn_update_lbl then ui.btn_update_lbl:text('Update Now') end
+    end
+end
+
+-- Set a body-status banner for N seconds (or until explicitly cleared).
+local function set_status_msg(msg, level)
+    ui.state.msg = msg or ''
+    ui.state.msg_color = level or 'info'
+    if settings.visible then redraw_body() end
 end
 
 local function show_ui()
@@ -304,6 +413,8 @@ local function show_ui()
     ui.btn_refresh_lbl:show()
     ui.btn_update:show()
     ui.btn_update_lbl:show()
+    -- Restore the button's visual state (was the last close mid-update?).
+    set_update_button_busy(ui.update_in_progress)
     redraw_body()
     -- Auto-refresh on open so the user always sees current state.
     refresh_status_async()
