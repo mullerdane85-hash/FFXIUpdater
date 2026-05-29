@@ -25,12 +25,27 @@ or drop the `FFXIUpdater` folder into `Windower/addons/`, then in-game:
 
 Autoload by adding `lua load FFXIUpdater` to `Windower/scripts/init.txt`.
 
+## Hotkey
+
+Press **Z** in-game to toggle the status window. Suppressed while chat
+is open so typing the letter 'z' still works.
+
+The window shows current branch + latest commit + clean/dirty status,
+with two buttons:
+
+- **Refresh** — re-read git state without pulling
+- **Update Now** — same as `//fu`, runs `git pull` in a cmd window
+
+Drag the title bar to move; position persists to `data/settings.xml`.
+
 ## Commands
 
 | Command | Effect |
 |---|---|
 | `//fu` | git pull, opens a cmd window so you can see the result |
 | `//fu status` | branch, latest commit, dirty files — printed to chat |
+| `//fu show` / `//fu hide` | open / close the status window programmatically |
+| `//fu toggle` | same as pressing Z |
 | `//fu help` | the list above |
 
 `//ffxiupdater` and `//update` are accepted as aliases.
