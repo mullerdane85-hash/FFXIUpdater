@@ -21,7 +21,7 @@ ARE DISCLAIMED.
 
 _addon = {}
 _addon.name      = 'FFXIUpdater'
-_addon.version   = '1.2.1'
+_addon.version   = '1.3.0'
 _addon.author    = 'TWinn22'
 _addon.commands  = {'fu', 'ffxiupdater', 'update'}
 
@@ -240,13 +240,17 @@ local function do_update()
     -- Clear any stale completion marker from a previous run.
     os.remove(pull_log)
 
-    -- Feedback: in-game chat, button visual, body banner.
-    say(207, 'Starting update — a cmd window will show git pull output.')
+    -- Feedback: chat, button recolor + label, banner, ticking elapsed.
+    say(207, 'Starting update — git pull running in a cmd window.')
+    ui.update_in_progress  = true
+    ui.update_start_time   = os.time()
     if settings.visible then
         set_update_button_busy(true)
-        set_status_msg('Updating... (cmd window opened — output is there)', 'info')
+        set_status_msg('git pull starting...', 'busy')
     end
-    ui.update_in_progress = true
+    -- Kick off the ticking elapsed-seconds poller (also runs even when
+    -- the window is hidden so reopening it mid-pull shows live state).
+    coroutine.schedule(tick_elapsed, 1)
 
     windower.send_command('@exec ' .. bat)
 
@@ -262,7 +266,7 @@ local function do_update()
             -- the exit code yet, presence of the file is enough).
             f:close()
             os.remove(pull_log)
-            ui.update_in_progress = false
+            ui.update_in_progress = false   -- stops tick_elapsed at its next check
             -- Re-read git state, which will update ui.state.commit.
             refresh_status_async()
             -- After the status refresh completes (~1.5 s), compare commits.
@@ -354,19 +358,65 @@ end
 -- state without pulling. Click "Update Now" to run //fu.
 -- ============================================================================
 
-local W, H = 460, 200   -- window size
+-- =====================================================================
+-- GSUI color palette (matches the GSUI overlay so the two addons look
+-- like siblings on screen).  Windower image/text colors use 0-255 RGB.
+-- =====================================================================
+local C = {
+    bg_deep    = {a = 240, r =  14, g =  23, b =  38},  -- main panel
+    bg_panel   = {a = 240, r =  22, g =  34, b =  58},  -- title bar / footer
+    bg_panel2  = {a = 240, r =  27, g =  42, b =  71},  -- button rest
+    bg_row     = {a = 240, r =  34, g =  52, b =  90},  -- selected row
+    accent     = {a = 255, r =  95, g = 200, b = 255},  -- cyan
+    accent_dim = {a = 240, r =  58, g = 111, b = 165},  -- pressed/idle accent
+    border     = {a = 240, r =  58, g =  90, b = 153},  -- frame lines
+    text_main  = {a = 255, r = 229, g = 238, b = 248},  -- white-ish
+    text_muted = {a = 255, r = 156, g = 177, b = 204},  -- secondary text
+    text_dim   = {a = 255, r = 111, g = 134, b = 164},  -- footer text
+    ok         = {a = 255, r = 126, g = 224, b = 122},  -- green dot
+    warn       = {a = 255, r = 227, g = 195, b =  90},  -- yellow dot
+    err        = {a = 255, r = 227, g = 108, b = 108},  -- red dot
+    busy       = {a = 255, r =  95, g = 200, b = 255},  -- cyan dot when updating
+}
+
+-- =====================================================================
+-- Layout constants — everything addresses pos relative to the window
+-- origin (settings.pos.x / .y) so a single move_ui() pass repositions
+-- the whole panel.
+-- =====================================================================
+local W, H = 500, 270
+
+-- y-offsets of each band
+local Y_TITLE     =   0           -- title bar 0..36
+local Y_TITLE_END =  36
+local Y_BODY      =  48           -- status block 48..170
+local Y_BUTTONS   = 180           -- button row 180..212
+local Y_FOOT_LINE = 222           -- 1px separator above footer
+local Y_FOOTER    = 226           -- footer 226..H
 
 local ui = {
-    panel     = nil,
-    border    = nil,
-    title     = nil,
-    body      = nil,         -- shows multi-line status text
-    btn_close = nil,
+    -- visual frame
+    border_outer = nil,    -- 1px accent rect — drawn first behind panel
+    panel        = nil,    -- main BgDeep panel
+    titlebar_bg  = nil,    -- BgPanel strip across the top
+    title_line   = nil,    -- 1px cyan separator at y=Y_TITLE_END
+    footer_bg    = nil,    -- BgPanel strip at the bottom
+    foot_line    = nil,    -- 1px cyan separator at y=Y_FOOT_LINE
+    -- texts
+    title        = nil,
+    version      = nil,    -- "v1.3.0" subtitle next to title
+    body         = nil,
+    footer_text  = nil,
+    -- close X
+    btn_close    = nil,
     btn_close_lbl = nil,
-    btn_refresh = nil,
+    -- buttons
+    btn_refresh  = nil,
     btn_refresh_lbl = nil,
-    btn_update = nil,
+    btn_update   = nil,
     btn_update_lbl = nil,
+    -- status indicator dot (small filled square next to Status: row)
+    status_dot   = nil,
 
     -- runtime state cached for redraws / drag
     state = {
@@ -374,222 +424,276 @@ local ui = {
         commit  = '?',
         dirty   = '?',
         checked = 'never',
-        msg     = '',            -- bottom-of-body status banner (e.g. "Updating...")
-        msg_color = 'info',      -- 'info' | 'ok' | 'warn'
+        msg     = '',
+        dot     = 'warn',          -- 'ok' | 'warn' | 'err' | 'busy'
     },
     drag = {
         active = false,
-        ox = 0, oy = 0,        -- offset from cursor to window origin while dragging
+        ox = 0, oy = 0,
     },
-    update_in_progress = false,
-    last_commit_before_update = nil,  -- so we can detect actual change after pull
+    update_in_progress       = false,
+    update_start_time        = 0,
+    last_commit_before_update = nil,
 }
 
 -- ---------------------------------------------------------------------------
 -- click rectangles (recomputed every move based on settings.pos)
 -- ---------------------------------------------------------------------------
 local function rect_titlebar()
-    return settings.pos.x, settings.pos.y, settings.pos.x + W - 30, settings.pos.y + 30
+    return settings.pos.x, settings.pos.y, settings.pos.x + W - 36, settings.pos.y + Y_TITLE_END
 end
 local function rect_close()
-    return settings.pos.x + W - 28, settings.pos.y + 4, settings.pos.x + W - 6, settings.pos.y + 26
+    return settings.pos.x + W - 32, settings.pos.y + 6, settings.pos.x + W - 8, settings.pos.y + 30
 end
 local function rect_refresh()
-    return settings.pos.x + 16, settings.pos.y + 158, settings.pos.x + 116, settings.pos.y + 186
+    return settings.pos.x + 20, settings.pos.y + Y_BUTTONS, settings.pos.x + 160, settings.pos.y + Y_BUTTONS + 32
 end
 local function rect_update()
-    return settings.pos.x + 140, settings.pos.y + 158, settings.pos.x + 280, settings.pos.y + 186
+    return settings.pos.x + 180, settings.pos.y + Y_BUTTONS, settings.pos.x + 360, settings.pos.y + Y_BUTTONS + 32
 end
 
 local function point_in_rect(x, y, x1, y1, x2, y2)
     return x >= x1 and x <= x2 and y >= y1 and y <= y2
 end
 
--- ---------------------------------------------------------------------------
--- Build UI elements once at load. Hidden until show_ui() is called.
--- All colors picked to mirror GSUI: dark navy bg, cyan accents.
--- ---------------------------------------------------------------------------
-local function build_ui()
-    ui.panel = images.new({
-        pos     = settings.pos,
-        size    = {width = W, height = H},
-        color   = {alpha = 235, red =  14, green =  23, blue =  38},
+-- Small builder helpers to keep build_ui readable.
+local function img(x, y, w, h, c)
+    return images.new({
+        pos     = {x = x, y = y},
+        size    = {width = w, height = h},
+        color   = {alpha = c.a, red = c.r, green = c.g, blue = c.b},
         visible = false,
     })
+end
 
-    ui.border = images.new({
-        pos     = settings.pos,
-        size    = {width = W, height = H},
-        color   = {alpha =   0, red =   0, green =   0, blue =   0},
-        visible = false,
-    })
-    -- (no native stroke in images.new; we draw a faint inset frame by
-    --  showing a slightly smaller darker panel underneath for depth)
-
-    -- IMPORTANT: any text that uses `stroke = {...}` inside `text` OR
-    -- `flags = {bold = true}` gets locked onto a render path that
-    -- ignores subsequent `:pos(x, y)` calls — the text never moves when
-    -- the panel drags. Found this empirically: the button labels (which
-    -- have neither stroke nor bold) tracked the drag fine, but the
-    -- title / body / X label stayed put. Workaround: drop stroke and
-    -- flags.bold across the board, lean on color + size for emphasis.
-    ui.title = texts.new('FFXIUpdater v' .. _addon.version, {
-        pos   = {x = settings.pos.x + 12, y = settings.pos.y + 6},
-        text  = {font = 'Arial', size = 14, alpha = 255, red = 95, green = 200, blue = 255},
+local function txt(s, x, y, font, size, c)
+    return texts.new(s, {
+        pos   = {x = x, y = y},
+        text  = {font = font, size = size, alpha = c.a, red = c.r, green = c.g, blue = c.b},
         bg    = {visible = false},
         flags = {draggable = false},
-        visible = false,
-    })
-
-    ui.body = texts.new('', {
-        pos   = {x = settings.pos.x + 14, y = settings.pos.y + 40},
-        text  = {font = 'Consolas', size = 11, alpha = 255, red = 229, green = 238, blue = 248},
-        bg    = {visible = false},
-        flags = {draggable = false},
-        visible = false,
-    })
-
-    -- Close button (top-right X)
-    ui.btn_close = images.new({
-        pos     = {x = settings.pos.x + W - 28, y = settings.pos.y + 4},
-        size    = {width = 22, height = 22},
-        color   = {alpha = 235, red = 130, green =  40, blue =  40},
-        visible = false,
-    })
-    -- X label gets no flags.bold for the same reason as title/body.
-    ui.btn_close_lbl = texts.new('X', {
-        pos   = {x = settings.pos.x + W - 22, y = settings.pos.y + 5},
-        text  = {font = 'Arial', size = 13, alpha = 255, red = 255, green = 230, blue = 230},
-        bg    = {visible = false},
-        flags = {draggable = false},
-        visible = false,
-    })
-
-    -- Refresh button
-    ui.btn_refresh = images.new({
-        pos     = {x = settings.pos.x + 16, y = settings.pos.y + 158},
-        size    = {width = 100, height = 28},
-        color   = {alpha = 235, red =  27, green =  42, blue =  71},
-        visible = false,
-    })
-    ui.btn_refresh_lbl = texts.new('Refresh', {
-        pos   = {x = settings.pos.x + 42, y = settings.pos.y + 164},
-        text  = {font = 'Arial', size = 11, alpha = 255, red = 229, green = 238, blue = 248},
-        bg    = {visible = false},
-        flags = {draggable = false},
-        visible = false,
-    })
-
-    -- Update Now button (accent)
-    ui.btn_update = images.new({
-        pos     = {x = settings.pos.x + 140, y = settings.pos.y + 158},
-        size    = {width = 140, height = 28},
-        color   = {alpha = 235, red =  58, green = 111, blue = 165},
-        visible = false,
-    })
-    ui.btn_update_lbl = texts.new('Update Now', {
-        pos   = {x = settings.pos.x + 168, y = settings.pos.y + 164},
-        text  = {font = 'Arial', size = 11, alpha = 255, red = 229, green = 238, blue = 248},
-        bg    = {visible = false},
-        flags = {bold = true, draggable = false},
         visible = false,
     })
 end
 
 -- ---------------------------------------------------------------------------
--- Reposition all UI elements after a drag.
--- Use the combined :pos(x, y) form on texts — separate :pos_x() / :pos_y()
--- calls were dropping one axis on some Windower builds, which is what
--- made the title / body / button labels stay put when dragging the panel.
--- :pos(x, y) sets both atomically and triggers the redraw cleanly.
+-- Build UI elements once at load. Hidden until show_ui() is called.
+-- Layout target — match GSUI's look so the two overlays feel related:
+--
+--   +================================================+  outer accent
+--   | (BgPanel)  FFXIUpdater  v1.3.0              [X]|  title strip y=0..36
+--   +================================================+  1px cyan separator
+--   |                                                |
+--   |   Branch    :  main                            |
+--   |   Commit    :  d1cf291 v1.2.1: drag now mov... |
+--   |   Status    :  ● clean                         |
+--   |   Checked   :  19:45:11                        |
+--   |                                                |
+--   |   >> Updating... 3s elapsed                    |  status banner
+--   |                                                |
+--   |   [ Refresh ]       [ Update Now ]             |  button row y=180
+--   |                                                |
+--   +================================================+  1px cyan separator
+--   | (BgPanel)  Press Z to toggle · auto-reload: ON |  footer y=226..H
+--   +================================================+
+-- ---------------------------------------------------------------------------
+local function build_ui()
+    local px, py = settings.pos.x, settings.pos.y
+
+    -- 1-pixel-wider outer accent rect, drawn first so the BgDeep panel
+    -- on top of it leaves a 1px cyan border showing on all four sides.
+    ui.border_outer = img(px - 1, py - 1, W + 2, H + 2, C.border)
+
+    -- Main dark navy body
+    ui.panel        = img(px, py, W, H, C.bg_deep)
+
+    -- Title strip (slightly lighter than the body so the title band reads)
+    ui.titlebar_bg  = img(px, py + Y_TITLE, W, Y_TITLE_END - Y_TITLE, C.bg_panel)
+
+    -- 1px cyan separator under the title
+    ui.title_line   = img(px, py + Y_TITLE_END, W, 1, C.accent)
+
+    -- Footer strip + separator above it
+    ui.foot_line    = img(px, py + Y_FOOT_LINE, W, 1, C.accent)
+    ui.footer_bg    = img(px, py + Y_FOOTER, W, H - Y_FOOTER, C.bg_panel)
+
+    -- Title text + version subtitle (kept as plain non-bold texts so they
+    -- track drags — see v1.2.1 commit for the stroke/bold movement bug).
+    ui.title   = txt('FFXIUpdater', px + 14, py + 8,  'Arial',   15, C.accent)
+    ui.version = txt('v' .. _addon.version, px + 130, py + 11, 'Arial', 10, C.text_muted)
+
+    -- Close button (X) top-right
+    ui.btn_close     = img(px + W - 32, py + 6, 24, 24, {a=240, r=130, g=40, b=40})
+    ui.btn_close_lbl = txt('X', px + W - 26, py + 8, 'Arial', 13, C.text_main)
+
+    -- Status block — one multi-line text so layout stays simple. Each
+    -- row is "Label    :  value" with consistent padding via printf.
+    ui.body = txt('', px + 24, py + Y_BODY, 'Consolas', 11, C.text_main)
+
+    -- Tiny colored dot next to the "Status:" row. Placed manually because
+    -- the body is a single text block. Default position is row 3 of body.
+    ui.status_dot = img(px + 110, py + Y_BODY + 36, 10, 10, C.warn)
+
+    -- Buttons
+    ui.btn_refresh     = img(px + 20, py + Y_BUTTONS, 140, 32, C.bg_panel2)
+    ui.btn_refresh_lbl = txt('Refresh', px + 64, py + Y_BUTTONS + 8, 'Arial', 12, C.text_main)
+
+    ui.btn_update      = img(px + 180, py + Y_BUTTONS, 180, 32, C.accent_dim)
+    ui.btn_update_lbl  = txt('Update Now', px + 220, py + Y_BUTTONS + 8, 'Arial', 12, C.text_main)
+
+    -- Footer hint
+    ui.footer_text = txt('Press Z to toggle  ·  auto-reload: ON', px + 14, py + Y_FOOTER + 9,
+                         'Arial', 10, C.text_dim)
+end
+
+-- ---------------------------------------------------------------------------
+-- Reposition every UI element after a drag. Same offsets as build_ui so
+-- the two must stay in sync. Uses :pos(x, y) for everything because the
+-- separate :pos_x() / :pos_y() pair drops one axis on some Windower
+-- builds (see v1.1.1 commit message).
 -- ---------------------------------------------------------------------------
 local function move_ui(dx, dy)
     settings.pos.x = settings.pos.x + dx
     settings.pos.y = settings.pos.y + dy
     local px, py = settings.pos.x, settings.pos.y
+
+    if ui.border_outer    then ui.border_outer:pos(px - 1, py - 1) end
     if ui.panel           then ui.panel:pos(px, py) end
-    if ui.border          then ui.border:pos(px, py) end
-    if ui.title           then ui.title:pos(px + 12, py + 6) end
-    if ui.body            then ui.body:pos(px + 14, py + 40) end
-    if ui.btn_close       then ui.btn_close:pos(px + W - 28, py + 4) end
-    if ui.btn_close_lbl   then ui.btn_close_lbl:pos(px + W - 22, py + 5) end
-    if ui.btn_refresh     then ui.btn_refresh:pos(px + 16, py + 158) end
-    if ui.btn_refresh_lbl then ui.btn_refresh_lbl:pos(px + 42, py + 164) end
-    if ui.btn_update      then ui.btn_update:pos(px + 140, py + 158) end
-    if ui.btn_update_lbl  then ui.btn_update_lbl:pos(px + 168, py + 164) end
+    if ui.titlebar_bg     then ui.titlebar_bg:pos(px, py + Y_TITLE) end
+    if ui.title_line      then ui.title_line:pos(px, py + Y_TITLE_END) end
+    if ui.foot_line       then ui.foot_line:pos(px, py + Y_FOOT_LINE) end
+    if ui.footer_bg       then ui.footer_bg:pos(px, py + Y_FOOTER) end
+
+    if ui.title           then ui.title:pos(px + 14, py + 8) end
+    if ui.version         then ui.version:pos(px + 130, py + 11) end
+    if ui.body            then ui.body:pos(px + 24, py + Y_BODY) end
+    if ui.status_dot      then ui.status_dot:pos(px + 110, py + Y_BODY + 36) end
+    if ui.footer_text     then ui.footer_text:pos(px + 14, py + Y_FOOTER + 9) end
+
+    if ui.btn_close       then ui.btn_close:pos(px + W - 32, py + 6) end
+    if ui.btn_close_lbl   then ui.btn_close_lbl:pos(px + W - 26, py + 8) end
+    if ui.btn_refresh     then ui.btn_refresh:pos(px + 20, py + Y_BUTTONS) end
+    if ui.btn_refresh_lbl then ui.btn_refresh_lbl:pos(px + 64, py + Y_BUTTONS + 8) end
+    if ui.btn_update      then ui.btn_update:pos(px + 180, py + Y_BUTTONS) end
+    if ui.btn_update_lbl  then ui.btn_update_lbl:pos(px + 220, py + Y_BUTTONS + 8) end
 end
 
 -- ---------------------------------------------------------------------------
--- Render the cached state into the body text. If a status message is
--- set (msg field), it appears as an extra line at the bottom — used to
--- give immediate feedback when the Update button is clicked, before
--- the actual git pull completes.
+-- Render the cached state into the body text. Each line is padded so the
+-- "label : value" columns align in the monospace font.
 -- ---------------------------------------------------------------------------
 local function redraw_body()
     local s = ui.state
+    -- Body has fixed slot for branch/commit/status/checked, then a
+    -- blank line, then the optional status banner.
     local body = string.format(
-        'Branch:   %s\n' ..
-        'Commit:   %s\n' ..
-        'Status:   %s\n' ..
-        'Checked:  %s',
+        'Branch    :  %s\n' ..
+        'Commit    :  %s\n' ..
+        'Status    :     %s\n' ..  -- extra space leaves room for the dot
+        'Checked   :  %s',
         s.branch, s.commit, s.dirty, s.checked)
     if s.msg and s.msg ~= '' then
         body = body .. '\n\n>> ' .. s.msg
     end
-    ui.body:text(body)
-end
+    if ui.body then ui.body:text(body) end
 
--- Update-button visual state. When an update is running, the button is
--- dimmed and its label changes to "Updating..." so the user knows the
--- click registered even before they see the cmd window appear.
-local function set_update_button_busy(busy)
-    if not ui.btn_update then return end
-    if busy then
-        ui.btn_update:color(70, 90, 110)         -- dim slate
-        if ui.btn_update_lbl then ui.btn_update_lbl:text('Updating...') end
-    else
-        ui.btn_update:color(58, 111, 165)        -- accent cyan/blue
-        if ui.btn_update_lbl then ui.btn_update_lbl:text('Update Now') end
+    -- Status dot color tracks the dot state.
+    if ui.status_dot then
+        local dotc = C[s.dot] or C.warn
+        ui.status_dot:color(dotc.r, dotc.g, dotc.b)
     end
 end
 
--- Set a body-status banner for N seconds (or until explicitly cleared).
+local function refresh_footer()
+    if not ui.footer_text then return end
+    ui.footer_text:text(string.format(
+        'Press Z to toggle  ·  auto-reload: %s',
+        settings.auto_reload and 'ON' or 'off'))
+end
+
+-- Update-button visual state. When an update is running, the button is
+-- recolored bright cyan and the label ticks elapsed seconds so the user
+-- can see the addon IS doing something — no more silent click.
+local function set_update_button_busy(busy)
+    if not ui.btn_update then return end
+    if busy then
+        -- Bright cyan accent — "busy" rather than "available". Looks
+        -- distinctly different from the idle state and from a disabled
+        -- state. The label is overwritten by the elapsed-time poller
+        -- below, but we start with "Updating..." in case the poller
+        -- hasn't run its first tick yet.
+        ui.btn_update:color(C.busy.r, C.busy.g, C.busy.b)
+        if ui.btn_update_lbl then ui.btn_update_lbl:text('Updating...') end
+        ui.state.dot = 'busy'
+    else
+        ui.btn_update:color(C.accent_dim.r, C.accent_dim.g, C.accent_dim.b)
+        if ui.btn_update_lbl then ui.btn_update_lbl:text('Update Now') end
+    end
+    if settings.visible then redraw_body() end
+end
+
+-- Set a body-status banner. Banner stays until next refresh_status or
+-- explicit clear.
 local function set_status_msg(msg, level)
     ui.state.msg = msg or ''
-    ui.state.msg_color = level or 'info'
+    if level and (level == 'ok' or level == 'warn' or level == 'err' or level == 'busy') then
+        ui.state.dot = level
+    end
     if settings.visible then redraw_body() end
+end
+
+-- ---------------------------------------------------------------------------
+-- Ticking feedback: while update_in_progress is true, refresh the button
+-- label and the body banner once a second with the elapsed seconds. Both
+-- the click signal (initial recolor) AND this ongoing tick are needed to
+-- visibly distinguish "click registered → working" from "nothing happened."
+-- ---------------------------------------------------------------------------
+local function tick_elapsed()
+    if not ui.update_in_progress then return end
+    local elapsed = os.time() - (ui.update_start_time or os.time())
+    if ui.btn_update_lbl then
+        ui.btn_update_lbl:text(string.format('Updating... %ds', elapsed))
+    end
+    set_status_msg(string.format(
+        'git pull running... %ds elapsed (cmd window has the live output)',
+        elapsed), 'busy')
+    -- Also nudge chat every 5 s so users not staring at the panel
+    -- still know something's happening.
+    if elapsed > 0 and elapsed % 5 == 0 then
+        say(207, string.format('still running... %ds elapsed', elapsed))
+    end
+    coroutine.schedule(tick_elapsed, 1)
+end
+
+-- All visible elements, in z-order from back to front.
+local function ui_elements()
+    return {
+        ui.border_outer, ui.panel,
+        ui.titlebar_bg, ui.title_line,
+        ui.foot_line,   ui.footer_bg,
+        ui.title,       ui.version,
+        ui.btn_close,   ui.btn_close_lbl,
+        ui.body,        ui.status_dot,
+        ui.btn_refresh, ui.btn_refresh_lbl,
+        ui.btn_update,  ui.btn_update_lbl,
+        ui.footer_text,
+    }
 end
 
 local function show_ui()
     if not ui.panel then build_ui() end
     settings.visible = true
-    ui.panel:show()
-    ui.title:show()
-    ui.body:show()
-    ui.btn_close:show()
-    ui.btn_close_lbl:show()
-    ui.btn_refresh:show()
-    ui.btn_refresh_lbl:show()
-    ui.btn_update:show()
-    ui.btn_update_lbl:show()
-    -- Restore the button's visual state (was the last close mid-update?).
+    for _, e in ipairs(ui_elements()) do if e then e:show() end end
+    -- Restore the button's visual state in case we're reopening mid-update.
     set_update_button_busy(ui.update_in_progress)
+    refresh_footer()
     redraw_body()
-    -- Auto-refresh on open so the user always sees current state.
-    refresh_status_async()
+    refresh_status_async()  -- auto-fresh on open
 end
 
 local function hide_ui()
     settings.visible = false
-    if ui.panel then ui.panel:hide() end
-    if ui.title then ui.title:hide() end
-    if ui.body  then ui.body:hide() end
-    if ui.btn_close then ui.btn_close:hide() end
-    if ui.btn_close_lbl then ui.btn_close_lbl:hide() end
-    if ui.btn_refresh then ui.btn_refresh:hide() end
-    if ui.btn_refresh_lbl then ui.btn_refresh_lbl:hide() end
-    if ui.btn_update then ui.btn_update:hide() end
-    if ui.btn_update_lbl then ui.btn_update_lbl:hide() end
+    for _, e in ipairs(ui_elements()) do if e then e:hide() end end
 end
 
 local function toggle_ui()
@@ -664,6 +768,12 @@ function refresh_status_async()
         f:close()
         ui.state.dirty   = dirty_lines == 0 and 'clean' or (dirty_lines .. ' file(s) modified')
         ui.state.checked = os.date('%Y-%m-%d %H:%M:%S')
+        -- Status dot color tracks the state: green when clean, yellow
+        -- when there are uncommitted edits, cyan during an active pull,
+        -- red on parse failure. Don't override 'busy' mid-update.
+        if not ui.update_in_progress then
+            ui.state.dot = (dirty_lines == 0) and 'ok' or 'warn'
+        end
         if settings.visible then redraw_body() end
     end, 1.5)
 end
@@ -715,6 +825,7 @@ windower.register_event('addon command', function(arg, arg2)
             settings.auto_reload = not settings.auto_reload
         end
         config.save(settings)
+        refresh_footer()
         say(207, 'auto-reload after update: ' .. (settings.auto_reload and 'ON' or 'off'))
     elseif arg == 'help' or arg == 'h' or arg == '?' then
         do_help()
