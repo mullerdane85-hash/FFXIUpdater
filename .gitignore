@@ -3,3 +3,5 @@ pull.bat
 pull.result
 status.bat
 status.log
+diff.bat
+diff.log

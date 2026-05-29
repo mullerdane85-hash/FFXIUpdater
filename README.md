@@ -46,6 +46,7 @@ Drag the title bar to move; position persists to `data/settings.xml`.
 | `//fu status` | branch, latest commit, dirty files — printed to chat |
 | `//fu show` / `//fu hide` | open / close the status window programmatically |
 | `//fu toggle` | same as pressing Z |
+| `//fu autoreload on \| off` | after pull, auto-reload only the addons that actually changed (default ON) |
 | `//fu help` | the list above |
 
 `//ffxiupdater` and `//update` are accepted as aliases.
@@ -56,13 +57,37 @@ Pure-Lua Windower addons have no HTTP module, so we shell out:
 
 1. The addon writes a short `pull.bat` into its own folder.
 2. `windower.send_command('@exec pull.bat')` spawns it asynchronously.
-3. The bat `cd`s to Windower root, runs `git pull`, pauses so you can
-   read the result.
+3. The bat `cd`s to Windower root, runs `git pull`, writes a one-byte
+   `pull.result` marker, then pauses so you can read the cmd window.
+4. The addon polls `pull.result` once a second (up to 60 s). When it
+   appears, status is refreshed and the panel reports the new commit.
 
-For `//fu status` the same trick goes through a temp log file —
-`git status` writes to `status.log`, then a 2-second `coroutine.schedule`
-re-reads the log and prints each line to chat. No popup window for
-status, since it's small enough to inline.
+### Auto-reload after pull
+
+If `auto_reload` is on (default), the addon also runs:
+
+```
+git diff --name-only <old hash>..<new hash>
+```
+
+to find every file the pull touched, maps each path to an addon name,
+and issues the right reload command:
+
+| Changed path | Action |
+|---|---|
+| `addons/<X>/...` | `//lua reload <X>` |
+| `addons/GearSwap/data/...` | `//gs reload` |
+| `addons/FFXIUpdater/...` | skipped — would kill the running poller |
+| `plugins/`, `scripts/`, `res/` | reported in chat as "manual restart needed" |
+
+So after `//fu`, the addons that actually changed pick up their new
+code automatically. If only GearSwap data changed, only `//gs reload`
+fires — no unnecessary full-addon reloads.
+
+For `//fu status` the same shell-out trick goes through a temp log file
+— `git status` writes to `status.log`, then a 2-second
+`coroutine.schedule` re-reads the log and prints each line to chat. No
+popup window for status, since it's small enough to inline.
 
 ## Requirements
 

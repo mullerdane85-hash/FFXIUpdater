@@ -21,7 +21,7 @@ ARE DISCLAIMED.
 
 _addon = {}
 _addon.name      = 'FFXIUpdater'
-_addon.version   = '1.1.1'
+_addon.version   = '1.2.0'
 _addon.author    = 'TWinn22'
 _addon.commands  = {'fu', 'ffxiupdater', 'update'}
 
@@ -52,8 +52,14 @@ local addon_dir = (windower.addon_path or (windower_root .. '/addons/FFXIUpdater
 -- Settings (persisted to data/settings.xml)
 -- ============================================================================
 local defaults = {
-    pos     = {x = 200, y = 200},
-    visible = false,
+    pos         = {x = 200, y = 200},
+    visible     = false,
+    -- After a successful pull, auto-run `//lua reload <name>` for every
+    -- addon whose files changed (and `//gs reload` if any GearSwap data
+    -- file changed). Self-reload is always skipped — reloading
+    -- FFXIUpdater while it's running its own pull would kill the
+    -- post-pull coroutines mid-flight. Toggle with //fu autoreload on/off.
+    auto_reload = true,
 }
 local settings = config.load(defaults)
 
@@ -86,10 +92,115 @@ local function write_file(path, content)
     return true
 end
 
+-- =====================================================================
+-- Auto-reload helpers
+-- =====================================================================
+-- After a successful pull, ask git which files changed between the
+-- pre-pull and post-pull commits, map those paths to addon names, then
+-- send the right reload command for each. We skip ourselves because
+-- reloading FFXIUpdater mid-coroutine would kill the very poller that
+-- triggered the reload.
+--
+-- Path-to-action mapping:
+--   addons/<X>/...                  ->  //lua reload <X>
+--   addons/GearSwap/data/...        ->  //gs reload  (data files are
+--                                       hot-loaded by GearSwap, not by
+--                                       the lua loader, so reloading
+--                                       the addon would be excessive)
+--   plugins/, scripts/, res/        ->  no auto-action; reported only
+--                                       (those need Windower restart)
+-- =====================================================================
+
+-- Extract the 7-character short hash from a `git log --oneline` line
+-- like "f77916f v1.1.1: fix drag...".
+local function short_hash(commit_line)
+    if not commit_line then return '' end
+    return (commit_line:match('^(%S+)') or ''):sub(1, 7)
+end
+
+-- Spawn a bat that runs `git diff --name-only old..new`, then in 1.5 s
+-- read the resulting log and pass parsed addon names to on_complete.
+-- Result:
+--   on_complete(addons[], gs_data_changed, other_paths[])
+-- addons[]       = unique addon folder names whose files changed
+-- gs_data_changed = true if any addons/GearSwap/data/* changed
+-- other_paths[]  = list of changed paths outside addons/ (plugins,
+--                  scripts, res, etc.) — reported but not auto-actioned
+local function detect_changed_addons(old_hash, new_hash, on_complete)
+    if old_hash == '' or new_hash == '' or old_hash == new_hash then
+        on_complete({}, false, {})
+        return
+    end
+
+    local bat = addon_dir .. '/diff.bat'
+    local out = addon_dir .. '/diff.log'
+    os.remove(out)
+
+    local content = table.concat({
+        '@echo off',
+        'cd /d "' .. windower_root .. '"',
+        'git diff --name-only ' .. old_hash .. '..' .. new_hash .. ' > "' .. out .. '" 2>&1',
+    }, '\r\n') .. '\r\n'
+    if not write_file(bat, content) then
+        on_complete({}, false, {})
+        return
+    end
+    windower.send_command('@exec ' .. bat)
+
+    coroutine.schedule(function()
+        local f = io.open(out, 'r')
+        if not f then
+            on_complete({}, false, {})
+            return
+        end
+        local addons, seen, other = {}, {}, {}
+        local gs_data_changed = false
+        for line in f:lines() do
+            -- git on Windows still writes forward-slash paths in its
+            -- diff output, so the pattern is portable.
+            local addon_under_gs_data = line:match('^addons/GearSwap/data/')
+            local addon              = line:match('^addons/([^/]+)/')
+            if addon_under_gs_data then
+                gs_data_changed = true
+            elseif addon then
+                if not seen[addon] then
+                    seen[addon] = true
+                    table.insert(addons, addon)
+                end
+            elseif line ~= '' then
+                table.insert(other, line)
+            end
+        end
+        f:close()
+        on_complete(addons, gs_data_changed, other)
+    end, 1.5)
+end
+
+-- Send reload commands for the addons listed. Returns a label string
+-- summarizing what was reloaded (for the UI banner / chat).
+local function reload_addons(addons, gs_data_changed)
+    local reloaded, skipped = {}, {}
+    for _, name in ipairs(addons) do
+        if name:lower() == 'ffxiupdater' then
+            table.insert(skipped, name)
+        else
+            windower.send_command('lua reload ' .. name)
+            table.insert(reloaded, name)
+        end
+    end
+    if gs_data_changed then
+        windower.send_command('gs reload')
+        table.insert(reloaded, 'GearSwap (data)')
+    end
+    return reloaded, skipped
+end
+
+-- =====================================================================
 -- //fu pull — visible cmd window, pauses so user can read the result.
 -- Also drives the UI feedback path: button label flips to "Updating...",
 -- body gets a banner, and after 8s we refresh status and report whether
 -- the commit actually changed.
+-- =====================================================================
 local function do_update()
     if not is_git_checkout() then
         say(167, 'Windower root is not a git checkout (.git missing).')
@@ -156,18 +267,58 @@ local function do_update()
             refresh_status_async()
             -- After the status refresh completes (~1.5 s), compare commits.
             coroutine.schedule(function()
-                local before = ui.last_commit_before_update or ''
-                local after  = ui.state.commit or ''
-                local same   = (before:sub(1, 7) == after:sub(1, 7))
-                if settings.visible then
-                    set_update_button_busy(false)
-                    if same then
-                        set_status_msg('Already up to date (' .. after:sub(1, 7) .. ').', 'ok')
-                    else
-                        set_status_msg('Update complete — now at ' .. after:sub(1, 7) .. '. Reload affected addons.', 'ok')
+                local before_hash = short_hash(ui.last_commit_before_update or '')
+                local after_hash  = short_hash(ui.state.commit or '')
+                local same        = (before_hash ~= '' and before_hash == after_hash)
+
+                if settings.visible then set_update_button_busy(false) end
+
+                if same then
+                    -- No new commits — nothing to reload.
+                    if settings.visible then
+                        set_status_msg('Already up to date (' .. after_hash .. ').', 'ok')
                     end
+                    say(207, 'Already up to date.')
+                    return
                 end
-                say(207, same and 'Already up to date.' or ('Update complete — now at ' .. after:sub(1, 7) .. '.'))
+
+                -- Commits differ -> there's new code on disk. Decide what
+                -- to reload, then either fire the reloads or just report.
+                say(207, ('Update complete — now at %s.'):format(after_hash))
+                if settings.visible then
+                    set_status_msg(('Update complete — now at %s. Checking what to reload...'):format(after_hash), 'ok')
+                end
+
+                if not settings.auto_reload then
+                    if settings.visible then
+                        set_status_msg(('Update complete — now at %s. Auto-reload OFF — run //lua reload <name> yourself.'):format(after_hash), 'ok')
+                    end
+                    return
+                end
+
+                detect_changed_addons(before_hash, after_hash, function(addons, gs_data_changed, other)
+                    local reloaded, skipped = reload_addons(addons, gs_data_changed)
+                    -- Compose a concise summary for both chat and panel.
+                    local parts = {}
+                    if #reloaded > 0 then
+                        table.insert(parts, 'reloaded: ' .. table.concat(reloaded, ', '))
+                    end
+                    if #skipped > 0 then
+                        table.insert(parts, 'skipped self: ' .. table.concat(skipped, ', '))
+                    end
+                    if #other > 0 then
+                        table.insert(parts, ('%d non-addon file(s) changed (manual restart needed)'):format(#other))
+                    end
+                    if #reloaded == 0 and #skipped == 0 and #other == 0 then
+                        table.insert(parts, 'no addon files changed')
+                    end
+                    local summary = table.concat(parts, '; ')
+
+                    say(207, summary)
+                    if settings.visible then
+                        set_status_msg(('Update complete (%s) — %s'):format(after_hash, summary), 'ok')
+                    end
+                end)
             end, 2)
             return
         end
@@ -524,14 +675,16 @@ end
 
 local function do_help()
     say(207, 'commands:')
-    windower.add_to_chat(207, '  //fu                 git pull (update everything)')
-    windower.add_to_chat(207, '  //fu status          status to chat (branch, commit, dirty)')
-    windower.add_to_chat(207, '  //fu show / hide     open / close the on-screen panel')
-    windower.add_to_chat(207, '  //fu help            this list')
-    windower.add_to_chat(207, '  Z hotkey             toggles the on-screen panel')
+    windower.add_to_chat(207, '  //fu                       git pull (update everything)')
+    windower.add_to_chat(207, '  //fu status                status to chat (branch, commit, dirty)')
+    windower.add_to_chat(207, '  //fu show / hide           open / close the on-screen panel')
+    windower.add_to_chat(207, '  //fu autoreload on|off     after pull, auto //lua reload changed addons (now: '
+                              .. (settings.auto_reload and 'ON' or 'off') .. ')')
+    windower.add_to_chat(207, '  //fu help                  this list')
+    windower.add_to_chat(207, '  Z hotkey                   toggles the on-screen panel')
 end
 
-windower.register_event('addon command', function(arg)
+windower.register_event('addon command', function(arg, arg2)
     arg = (arg or ''):lower()
     if arg == '' or arg == 'pull' then
         do_update()
@@ -543,6 +696,18 @@ windower.register_event('addon command', function(arg)
         hide_ui()
     elseif arg == 'toggle' then
         toggle_ui()
+    elseif arg == 'autoreload' then
+        -- Accept `on`, `off`, `true`, `false`, `1`, `0`, or no arg (= toggle).
+        local v = (arg2 or ''):lower()
+        if v == 'on' or v == 'true' or v == '1' then
+            settings.auto_reload = true
+        elseif v == 'off' or v == 'false' or v == '0' then
+            settings.auto_reload = false
+        else
+            settings.auto_reload = not settings.auto_reload
+        end
+        config.save(settings)
+        say(207, 'auto-reload after update: ' .. (settings.auto_reload and 'ON' or 'off'))
     elseif arg == 'help' or arg == 'h' or arg == '?' then
         do_help()
     else
