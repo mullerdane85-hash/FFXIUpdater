@@ -1,3 +1,18 @@
+<!-- BEGIN DISCLAIMER (managed by FFXIWindower author; do not remove) -->
+## ⚠️ Disclaimer — Use at Your Own Risk
+
+This is unofficial, fan-made software for *Final Fantasy XI*. It is **not affiliated with, endorsed by, or supported by Square Enix Holdings Co., Ltd.** FINAL FANTASY is a registered trademark of Square Enix.
+
+**Square Enix's official position is that third-party tools and modifications to the FFXI client are prohibited by the Terms of Service.** Installing or using this software may result in account suspension, account termination, character data loss, or other action taken by Square Enix at their sole discretion.
+
+This software is provided **AS IS, without warranty of any kind**, express or implied — including but not limited to warranties of merchantability, fitness for a particular purpose, and non-infringement. In no event shall the author or contributors be liable for any claim, damages, account action, lost time, lost progress, file corruption, or any other liability arising from the use of, or inability to use, this software.
+
+**By installing, building, or running this software you acknowledge that you understand and accept these risks.**
+
+<!-- END DISCLAIMER -->
+### Additional warning — supply-chain risk
+
+This addon performs `git pull` from a remote repository at runtime and (optionally) auto-reloads modified addons inside a running FFXI session. **That makes a compromise of the publishing GitHub account a malware-delivery vector to every user.** Even with the v2.0.0 safeguards (signed-commit verification, remote URL pinning, fast-forward-only pulls, sensitive-path blocklist, size circuit-breaker, preview/confirm two-step), an in-game auto-updater cannot be made as safe as a traditional out-of-game installer. **The author recommends against using this for any account you cannot afford to lose.** For personal multi-machine sync, `git pull` from a terminal between play sessions is strictly safer.
 # FFXIUpdater
 
 One-line `//fu` to git-pull your whole Windower folder. Built for the
