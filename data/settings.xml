@@ -10,8 +10,9 @@
     </global>
     <kalitzo>
         <pos>
-            <x>160</x>
-            <y>230</y>
+            <x>636</x>
+            <y>267</y>
         </pos>
+        <visible>true</visible>
     </kalitzo>
 </settings>

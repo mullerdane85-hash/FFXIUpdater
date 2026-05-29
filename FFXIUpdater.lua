@@ -21,7 +21,7 @@ ARE DISCLAIMED.
 
 _addon = {}
 _addon.name      = 'FFXIUpdater'
-_addon.version   = '1.3.1'
+_addon.version   = '1.3.2'
 _addon.author    = 'TWinn22'
 _addon.commands  = {'fu', 'ffxiupdater', 'update'}
 
@@ -47,6 +47,47 @@ local texts  = require('texts')
 local windower_root = windower.windower_path:gsub('\\$', ''):gsub('/$', '')
 local addon_dir = (windower.addon_path or (windower_root .. '/addons/FFXIUpdater/'))
                   :gsub('\\$', ''):gsub('/$', '')
+
+-- ----------------------------------------------------------------------------
+-- Forward declarations for locals that are USED inside earlier-defined
+-- functions but DECLARED later in the file. Without these the names resolve
+-- to global nil at function-definition time and every read of `ui.*` (or any
+-- forward-referenced helper) throws "attempt to index a nil value" at call
+-- time. Caused the line-213 crash + silent button-does-nothing bug in v1.3.x.
+-- ----------------------------------------------------------------------------
+local ui
+local set_status_msg
+local set_update_button_busy
+local tick_elapsed
+local refresh_status_async
+
+-- ----------------------------------------------------------------------------
+-- Process-spawning helpers. Windower addons don't expose any HTTP module
+-- AND `@exec` isn't a recognised command on this install — instead we use
+-- `os.execute` with cmd.exe's `start` builtin. `start "" /B path.bat`
+-- launches the bat in the background with no window (great for fast
+-- status queries that just write to a file); plain `start "" path.bat`
+-- launches with a visible cmd window (what the user wants for `git pull`
+-- so they can read the live transcript).
+--
+-- Important Windows-isms:
+--   * paths must use backslashes (Windower hands us forward slashes)
+--   * the empty "" after `start` is the window title — required because
+--     `start` otherwise treats the first quoted arg as the title
+-- ----------------------------------------------------------------------------
+local function to_windows_path(p)
+    return (p:gsub('/', '\\'))
+end
+
+-- Spawn a bat in the background with no window. Returns immediately.
+local function spawn_bg(bat)
+    os.execute('start "" /B "' .. to_windows_path(bat) .. '"')
+end
+
+-- Spawn a bat in a visible cmd window. Returns immediately.
+local function spawn_visible(bat)
+    os.execute('start "" "' .. to_windows_path(bat) .. '"')
+end
 
 -- ============================================================================
 -- Settings (persisted to data/settings.xml)
@@ -145,7 +186,7 @@ local function detect_changed_addons(old_hash, new_hash, on_complete)
         on_complete({}, false, {})
         return
     end
-    windower.send_command('@exec ' .. bat)
+    spawn_bg(bat)  -- diff bat runs silently in the background
 
     coroutine.schedule(function()
         local f = io.open(out, 'r')
@@ -252,7 +293,7 @@ local function do_update()
     -- the window is hidden so reopening it mid-pull shows live state).
     coroutine.schedule(tick_elapsed, 1)
 
-    windower.send_command('@exec ' .. bat)
+    spawn_visible(bat)  -- pull bat shows a cmd window so user sees git output
 
     -- Poll for completion. Most pulls finish in 2-6 s. We check every
     -- second for up to 60 s; the moment pull.result appears we refresh
@@ -394,7 +435,7 @@ local Y_BUTTONS   = 180           -- button row 180..212
 local Y_FOOT_LINE = 222           -- 1px separator above footer
 local Y_FOOTER    = 226           -- footer 226..H
 
-local ui = {
+ui = {  -- assigns to the forward-declared local at the top of the file
     -- visual frame
     border_outer = nil,    -- 1px accent rect — drawn first behind panel
     panel        = nil,    -- main BgDeep panel
@@ -623,7 +664,7 @@ end
 -- Update-button visual state. When an update is running, the button is
 -- recolored bright cyan and the label ticks elapsed seconds so the user
 -- can see the addon IS doing something — no more silent click.
-local function set_update_button_busy(busy)
+function set_update_button_busy(busy)  -- assigns to forward-declared local
     if not ui.btn_update then return end
     if busy then
         -- Bright cyan accent — "busy" rather than "available". Looks
@@ -643,7 +684,7 @@ end
 
 -- Set a body-status banner. Banner stays until next refresh_status or
 -- explicit clear.
-local function set_status_msg(msg, level)
+function set_status_msg(msg, level)  -- assigns to forward-declared local
     ui.state.msg = msg or ''
     if level and (level == 'ok' or level == 'warn' or level == 'err' or level == 'busy') then
         ui.state.dot = level
@@ -657,7 +698,7 @@ end
 -- the click signal (initial recolor) AND this ongoing tick are needed to
 -- visibly distinguish "click registered → working" from "nothing happened."
 -- ---------------------------------------------------------------------------
-local function tick_elapsed()
+function tick_elapsed()  -- assigns to forward-declared local
     if not ui.update_in_progress then return end
     local elapsed = os.time() - (ui.update_start_time or os.time())
     if ui.btn_update_lbl then
@@ -747,7 +788,7 @@ function refresh_status_async()
     }, '\r\n') .. '\r\n'
 
     if not write_file(bat, content) then return end
-    windower.send_command('@exec ' .. bat)
+    spawn_bg(bat)  -- status bat runs silently in the background
 
     coroutine.schedule(function()
         local f = io.open(out, 'r')
