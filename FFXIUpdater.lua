@@ -21,7 +21,7 @@ ARE DISCLAIMED.
 
 _addon = {}
 _addon.name      = 'FFXIUpdater'
-_addon.version   = '1.2.0'
+_addon.version   = '1.2.1'
 _addon.author    = 'TWinn22'
 _addon.commands  = {'fu', 'ffxiupdater', 'update'}
 
@@ -426,17 +426,24 @@ local function build_ui()
     -- (no native stroke in images.new; we draw a faint inset frame by
     --  showing a slightly smaller darker panel underneath for depth)
 
+    -- IMPORTANT: any text that uses `stroke = {...}` inside `text` OR
+    -- `flags = {bold = true}` gets locked onto a render path that
+    -- ignores subsequent `:pos(x, y)` calls — the text never moves when
+    -- the panel drags. Found this empirically: the button labels (which
+    -- have neither stroke nor bold) tracked the drag fine, but the
+    -- title / body / X label stayed put. Workaround: drop stroke and
+    -- flags.bold across the board, lean on color + size for emphasis.
     ui.title = texts.new('FFXIUpdater v' .. _addon.version, {
         pos   = {x = settings.pos.x + 12, y = settings.pos.y + 6},
-        text  = {font = 'Arial', size = 13, alpha = 255, red = 95, green = 200, blue = 255, stroke = {width = 1, alpha = 255, red = 0, green = 0, blue = 0}},
+        text  = {font = 'Arial', size = 14, alpha = 255, red = 95, green = 200, blue = 255},
         bg    = {visible = false},
-        flags = {bold = true, draggable = false},
+        flags = {draggable = false},
         visible = false,
     })
 
     ui.body = texts.new('', {
         pos   = {x = settings.pos.x + 14, y = settings.pos.y + 40},
-        text  = {font = 'Consolas', size = 11, alpha = 255, red = 229, green = 238, blue = 248, stroke = {width = 1, alpha = 200, red = 0, green = 0, blue = 0}},
+        text  = {font = 'Consolas', size = 11, alpha = 255, red = 229, green = 238, blue = 248},
         bg    = {visible = false},
         flags = {draggable = false},
         visible = false,
@@ -449,11 +456,12 @@ local function build_ui()
         color   = {alpha = 235, red = 130, green =  40, blue =  40},
         visible = false,
     })
+    -- X label gets no flags.bold for the same reason as title/body.
     ui.btn_close_lbl = texts.new('X', {
         pos   = {x = settings.pos.x + W - 22, y = settings.pos.y + 5},
-        text  = {font = 'Arial', size = 12, alpha = 255, red = 255, green = 230, blue = 230},
+        text  = {font = 'Arial', size = 13, alpha = 255, red = 255, green = 230, blue = 230},
         bg    = {visible = false},
-        flags = {bold = true, draggable = false},
+        flags = {draggable = false},
         visible = false,
     })
 
